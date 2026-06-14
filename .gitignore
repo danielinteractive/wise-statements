@@ -17,3 +17,7 @@ DESIRES.md
 
 # Node/pnpm
 node_modules/
+
+# Private call examples
+calls/
+.DS_Store

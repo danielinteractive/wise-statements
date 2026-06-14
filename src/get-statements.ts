@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { createSign, generateKeyPairSync } from 'node:crypto';
+import { createHash, createPublicKey, createSign, generateKeyPairSync } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import process from 'node:process';
@@ -23,6 +23,7 @@ type CliOptions = {
   statementLocale: string;
   statementType: 'COMPACT' | 'FLAT';
   start?: string;
+  supportReport: boolean;
 };
 
 type WiseProfile = {
@@ -50,10 +51,32 @@ type WiseRequest = {
   token: string;
 };
 
+type SupportReport = {
+  balanceId?: number | string;
+  challengeToken?: string;
+  currency?: string;
+  errorMessage?: string;
+  initialTraceId?: string | null;
+  intervalEnd?: string;
+  intervalStart?: string;
+  keySummary?: ReturnType<typeof keyDebugSummary>;
+  profileSummary?: ReturnType<typeof profileDebugSummary>;
+  publicRequestUrl?: string;
+  responseHeaders?: string;
+  signedResponseBody?: string;
+  signedTraceId?: string | null;
+  signatureSha256?: string;
+  statementType?: string;
+  tokenMasked?: string;
+  tokenSha256?: string;
+};
+
+const supportReport: SupportReport = {};
+
 function usage() {
   return `Usage:
   node src/get-statements.ts --start YYYY-MM-DD --end YYYY-MM-DD [options]
-  pnpm statements --start YYYY-MM-DD --end YYYY-MM-DD [options]
+  npm run statements -- --start YYYY-MM-DD --end YYYY-MM-DD [options]
 
 Options:
   --profile-id ID          Skip the interactive profile picker
@@ -64,10 +87,82 @@ Options:
   --locale en              Statement locale (default: en)
   --private-key PATH       RSA private key for SCA signing (default: WISE_PRIVATE_KEY_PATH or keys/wise-private.pem)
   --list-profiles          Print profiles visible to the token, then exit
+  --support-report         Print a paste-ready Wise support block on failure
   --generate-keypair       Generate keys/wise-private.pem and keys/wise-public.pem, then exit
   --help                   Show this help
 
 Date arguments accept YYYY-MM-DD or any ISO-8601 date-time. Date-only values are treated as UTC day bounds.`;
+}
+
+function debugEnabled() {
+  const value = process.env.WISE_DEBUG?.trim().toLowerCase();
+  return value === '1' || value === 'true' || value === 'yes';
+}
+
+function debugLog(message: string) {
+  if (debugEnabled()) {
+    console.error(`[wise-debug] ${message}`);
+  }
+}
+
+function sha256Hex(value: string) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function maskToken(token: string) {
+  if (token.length <= 8) {
+    return `${token.slice(0, 2)}...${token.slice(-2)}`;
+  }
+  return `${token.slice(0, 4)}...${token.slice(-4)}`;
+}
+
+function summarizeText(text: string, limit = 1_000) {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return '(empty)';
+  }
+  return trimmed.length <= limit ? trimmed : `${trimmed.slice(0, limit)}...`;
+}
+
+function keyDebugSummary(privateKeyPath: string) {
+  const resolvedPrivatePath = resolve(privateKeyPath);
+  const resolvedPublicPath = publicKeyPathForPrivateKey(privateKeyPath);
+  const privateKeyPem = readFileSync(resolvedPrivatePath, 'utf8');
+  const derivedPublicKeyPem = createPublicKey(privateKeyPem).export({ format: 'pem', type: 'spki' }).toString();
+  const publicKeyExists = existsSync(resolvedPublicPath);
+  const uploadedPublicKeyPem = publicKeyExists ? readFileSync(resolvedPublicPath, 'utf8') : null;
+
+  return {
+    privateKeyPath: resolvedPrivatePath,
+    publicKeyPath: resolvedPublicPath,
+    publicKeyExists,
+    derivedPublicKeySha256: sha256Hex(derivedPublicKeyPem),
+    filePublicKeySha256: uploadedPublicKeyPem ? sha256Hex(uploadedPublicKeyPem) : null,
+    publicKeysMatch: uploadedPublicKeyPem ? derivedPublicKeyPem === uploadedPublicKeyPem : null,
+  };
+}
+
+function interestingHeaders(response: Response) {
+  const picked = new Map<string, string>();
+  for (const [key, value] of response.headers.entries()) {
+    const normalizedKey = key.toLowerCase();
+    if (
+      normalizedKey.startsWith('x-')
+      || normalizedKey === 'content-type'
+      || normalizedKey === 'traceparent'
+      || normalizedKey === 'request-id'
+    ) {
+      picked.set(key, value);
+    }
+  }
+
+  if (picked.size === 0) {
+    return 'none';
+  }
+
+  return Array.from(picked.entries())
+    .map(([key, value]) => `${key}=${value}`)
+    .join(', ');
 }
 
 function loadEnvFileIfPresent() {
@@ -98,6 +193,7 @@ function parseArgs(args: string[]): CliOptions {
     outputDir: 'statements',
     statementLocale: 'en',
     statementType: 'COMPACT',
+    supportReport: false,
   };
 
   for (let index = 0; index < args.length; index += 1) {
@@ -186,6 +282,9 @@ function parseArgs(args: string[]): CliOptions {
         break;
       case '--list-profiles':
         options.listProfiles = true;
+        break;
+      case '--support-report':
+        options.supportReport = true;
         break;
       case '--help':
       case '-h':
@@ -289,24 +388,36 @@ async function wiseGetJson(request: WiseRequest) {
   for (const [key, value] of Object.entries(request.query ?? {})) {
     url.searchParams.set(key, value);
   }
+  supportReport.publicRequestUrl = url.toString();
 
   const headers = { Authorization: `Bearer ${request.token}` };
+  debugLog(`GET ${url.toString()}`);
   let response = await fetch(url, { headers });
 
   if (response.ok) {
     return parseJsonResponse(response);
   }
 
+  debugLog(
+    `Initial response ${response.status} ${response.statusText}; headers: ${interestingHeaders(response)}`,
+  );
+  supportReport.initialTraceId = response.headers.get('x-trace-id');
+
   const oneTimeToken = response.headers.get('x-2fa-approval');
   if (response.status === 403 && oneTimeToken) {
+    debugLog(`Wise SCA challenge token: ${oneTimeToken}`);
+    supportReport.challengeToken = oneTimeToken;
     if (!existsSync(request.privateKeyPath)) {
       throw new Error(
         `Wise requested SCA, but no private key exists at ${request.privateKeyPath}. ` +
-          'Run `pnpm generate-keypair`, upload keys/wise-public.pem to Wise, then rerun this command.',
+          'Run `npm run generate-keypair`, upload keys/wise-public.pem to Wise, then rerun this command.',
       );
     }
 
     const signature = signOneTimeToken(oneTimeToken, request.privateKeyPath);
+    debugLog(`Signature length=${signature.length}, sha256=${sha256Hex(signature)}`);
+    supportReport.signatureSha256 = sha256Hex(signature);
+    debugLog(`Retrying with SCA signature from ${resolve(request.privateKeyPath)}`);
     response = await fetch(url, {
       headers: {
         ...headers,
@@ -319,9 +430,28 @@ async function wiseGetJson(request: WiseRequest) {
       return parseJsonResponse(response);
     }
 
+    debugLog(
+      `Signed response ${response.status} ${response.statusText}; headers: ${interestingHeaders(response)}`,
+    );
+    const signedResponseText = await response.text();
+    debugLog(`Signed response body: ${summarizeText(signedResponseText)}`);
+    supportReport.signedTraceId = response.headers.get('x-trace-id');
+    supportReport.responseHeaders = interestingHeaders(response);
+    supportReport.signedResponseBody = summarizeText(signedResponseText);
+
     if (response.status === 403) {
-      throw await scaSignatureError(response, request.privateKeyPath);
+      throw scaSignatureError(response, request.privateKeyPath, url.toString(), signedResponseText);
     }
+
+    if (signedResponseText) {
+      try {
+        return JSON.parse(signedResponseText);
+      } catch {
+        throw new Error(`Wise returned non-JSON response from ${response.url}: ${signedResponseText.slice(0, 500)}`);
+      }
+    }
+
+    return null;
   }
 
   throw await wiseError(response);
@@ -346,14 +476,16 @@ async function wiseError(response: Response) {
   return new Error(`Wise API HTTP ${response.status} ${response.statusText}${body}`);
 }
 
-async function scaSignatureError(response: Response, privateKeyPath: string) {
-  const text = await response.text();
+function scaSignatureError(response: Response, privateKeyPath: string, requestUrl: string, text: string) {
   const result = response.headers.get('x-2fa-approval-result');
   const resultText = result ? ` (${result})` : '';
+  const headerSummary = interestingHeaders(response);
+  const headersText = headerSummary !== 'none' ? ` Response headers: ${headerSummary}.` : '';
   const body = text ? ` Wise response: ${text.slice(0, 1_000)}` : '';
   return new Error(
     `Wise rejected the SCA signature${resultText}. Upload ${publicKeyPathForPrivateKey(privateKeyPath)} ` +
-      `under Wise API tokens / Manage public keys, and make sure it matches ${resolve(privateKeyPath)}.${body}`,
+      `under Wise API tokens / Manage public keys, and make sure it matches ${resolve(privateKeyPath)}. ` +
+      `Request: ${requestUrl}.${headersText}${body}`,
   );
 }
 
@@ -404,6 +536,23 @@ function profileLabel(profile: WiseProfile) {
   const role = typeof roleValue === 'string' ? `, role=${roleValue}` : '';
   const state = profile.currentState ? `, state=${profile.currentState}` : '';
   return `id=${profile.id}, type=${profile.type}${state}${name ? `, name=${name}` : ''}${role}`;
+}
+
+function profileDebugSummary(profile: WiseProfile) {
+  const maybeAddress = (profile as Record<string, unknown>).address;
+  const addressCountry = typeof maybeAddress === 'object' && maybeAddress !== null
+    ? (maybeAddress as Record<string, unknown>).countryIso2Code
+    : undefined;
+  const registrationNumber = (profile as Record<string, unknown>).registrationNumber;
+  return {
+    id: profile.id,
+    type: profile.type,
+    currentState: profile.currentState ?? null,
+    name: profileName(profile),
+    companyRole: profile.companyRole ?? null,
+    addressCountry: typeof addressCountry === 'string' ? addressCountry : null,
+    registrationNumber: typeof registrationNumber === 'string' ? registrationNumber : null,
+  };
 }
 
 async function selectProfileByName(token: string, privateKeyPath: string, name: string) {
@@ -486,6 +635,40 @@ function balanceForCurrency(balances: WiseBalance[], currency: string) {
   return matches[0];
 }
 
+function balanceDebugSummary(balance: WiseBalance) {
+  return JSON.stringify({
+    id: balance.id,
+    currency: balance.currency,
+    type: balance.type ?? null,
+  });
+}
+
+function printSupportReport() {
+  const lines = [
+    '--- Wise Support Report ---',
+    `Token masked: ${supportReport.tokenMasked ?? 'unknown'}`,
+    `Token SHA-256: ${supportReport.tokenSha256 ?? 'unknown'}`,
+    `Profile summary: ${supportReport.profileSummary ? JSON.stringify(supportReport.profileSummary) : 'unknown'}`,
+    `Balance ID: ${supportReport.balanceId ?? 'unknown'}`,
+    `Currency: ${supportReport.currency ?? 'unknown'}`,
+    `Interval start: ${supportReport.intervalStart ?? 'unknown'}`,
+    `Interval end: ${supportReport.intervalEnd ?? 'unknown'}`,
+    `Statement type: ${supportReport.statementType ?? 'unknown'}`,
+    `Request URL: ${supportReport.publicRequestUrl ?? 'unknown'}`,
+    `Challenge token: ${supportReport.challengeToken ?? 'unknown'}`,
+    `Initial trace ID: ${supportReport.initialTraceId ?? 'unknown'}`,
+    `Signed trace ID: ${supportReport.signedTraceId ?? 'unknown'}`,
+    `Signature SHA-256: ${supportReport.signatureSha256 ?? 'unknown'}`,
+    `Response headers: ${supportReport.responseHeaders ?? 'unknown'}`,
+    `Signed response body: ${supportReport.signedResponseBody ?? 'unknown'}`,
+    `Key summary: ${supportReport.keySummary ? JSON.stringify(supportReport.keySummary) : 'unknown'}`,
+    `Final error: ${supportReport.errorMessage ?? 'unknown'}`,
+    '--- End Wise Support Report ---',
+  ];
+
+  console.error(lines.join('\n'));
+}
+
 async function getStatement(args: {
   balanceId: number | string;
   currency: string;
@@ -560,6 +743,11 @@ async function main() {
   }
 
   const token = requireApiToken();
+  supportReport.tokenMasked = maskToken(token);
+  supportReport.tokenSha256 = sha256Hex(token);
+  supportReport.keySummary = keyDebugSummary(privateKeyPath);
+  debugLog(`Token summary: masked=${supportReport.tokenMasked}, sha256=${supportReport.tokenSha256}`);
+  debugLog(`Key summary: ${JSON.stringify(supportReport.keySummary)}`);
 
   if (options.listProfiles) {
     const profiles = await getProfiles(token, privateKeyPath);
@@ -568,10 +756,44 @@ async function main() {
   }
 
   const { intervalStart, intervalEnd } = statementInterval(options);
+  supportReport.intervalStart = intervalStart;
+  supportReport.intervalEnd = intervalEnd;
+  supportReport.statementType = options.statementType;
+  debugLog(
+    `Statement parameters: ${JSON.stringify({
+      currencies: options.currencies,
+      intervalStart,
+      intervalEnd,
+      locale: options.statementLocale,
+      profileName: options.profileName ?? null,
+      statementType: options.statementType,
+    })}`,
+  );
+  const profiles = await getProfiles(token, privateKeyPath);
   const profileId = options.profileId
     ?? (options.profileName !== undefined
-      ? await selectProfileByName(token, privateKeyPath, options.profileName)
+      ? (() => {
+          const matches = profiles.filter((profile) => profile.currentState !== 'DEACTIVATED')
+            .filter((profile) => profileName(profile) === options.profileName);
+          if (matches.length === 1) {
+            return matches[0].id;
+          }
+          if (matches.length > 1) {
+            throw new Error(`Multiple active Wise profiles exactly matched name ${JSON.stringify(options.profileName)}. Use --profile-id instead.`);
+          }
+          const activeProfiles = profiles
+            .filter((profile) => profile.currentState !== 'DEACTIVATED')
+            .map((profile) => `  - ${profileLabel(profile)}`)
+            .join('\n');
+          throw new Error(`No active Wise profile exactly matched name ${JSON.stringify(options.profileName)}. Active profiles:\n${activeProfiles}`);
+        })()
       : await selectProfile(token, privateKeyPath));
+  debugLog(`Using Wise profile id ${profileId}`);
+  const selectedProfile = profiles.find((profile) => profile.id === profileId);
+  if (selectedProfile) {
+    supportReport.profileSummary = profileDebugSummary(selectedProfile);
+    debugLog(`Selected profile summary: ${JSON.stringify(supportReport.profileSummary)}`);
+  }
   const balances = await getBalances(token, privateKeyPath, profileId);
   const failures: string[] = [];
 
@@ -582,6 +804,9 @@ async function main() {
       console.error(`${currency}: no standard balance found`);
       continue;
     }
+    supportReport.currency = currency;
+    supportReport.balanceId = balance.id;
+    debugLog(`Selected balance summary for ${currency}: ${balanceDebugSummary(balance)}`);
 
     try {
       const statement = await getStatement({
@@ -608,12 +833,16 @@ async function main() {
       console.log(`${currency}: wrote ${outputPath}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      supportReport.errorMessage = message;
       failures.push(`${currency}: ${message}`);
       console.error(`${currency}: failed: ${message}`);
     }
   }
 
   if (failures.length > 0) {
+    if (options.supportReport) {
+      printSupportReport();
+    }
     throw new Error(`Finished with ${failures.length} failure(s).`);
   }
 }
